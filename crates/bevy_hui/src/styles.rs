@@ -177,7 +177,14 @@ impl<'w, 's> UiStyleQuery<'w, 's> {
         _ = self.background.get_mut(entity).map(|mut background| {
             background.0 = computed.background;
         });
-        
+
+        _ = self.node.get_mut(entity).map(|mut node| {
+            node.border_radius.top_left = computed.border_radius.top;
+            node.border_radius.top_right = computed.border_radius.right;
+            node.border_radius.bottom_right = computed.border_radius.bottom;
+            node.border_radius.bottom_left = computed.border_radius.left;
+        });
+
         if let Some(computed_shadow) = computed.text_shadow.as_ref() {
             _ = self.text_shadows.get_mut(entity).map(|mut shadow| {
                 shadow.color = computed_shadow.color;
@@ -271,17 +278,18 @@ impl<'w, 's> UiStyleQuery<'w, 's> {
                     bcolor.bottom = color;
                 });
             }
-            // StyleAttr::BorderRadius(ui_rect) => {
-            //     _ = self.border_radius.get_mut(entity).map(|mut bradius| {
-            //         bradius.top_left = lerp_val(&computed.border_radius.top, &ui_rect.top, ratio);
-            //         bradius.top_right =
-            //             lerp_val(&computed.border_radius.right, &ui_rect.right, ratio);
-            //         bradius.bottom_right =
-            //             lerp_val(&computed.border_radius.bottom, &ui_rect.bottom, ratio);
-            //         bradius.bottom_left =
-            //             lerp_val(&computed.border_radius.left, &ui_rect.left, ratio);
-            //     });
-            // }
+            StyleAttr::BorderRadius(ui_rect) => {
+                _ = self.node.get_mut(entity).map(|mut node| {
+                    node.border_radius.top_left =
+                        lerp_val(&computed.border_radius.top, &ui_rect.top, ratio);
+                    node.border_radius.top_right =
+                        lerp_val(&computed.border_radius.right, &ui_rect.right, ratio);
+                    node.border_radius.bottom_right =
+                        lerp_val(&computed.border_radius.bottom, &ui_rect.bottom, ratio);
+                    node.border_radius.bottom_left =
+                        lerp_val(&computed.border_radius.left, &ui_rect.left, ratio);
+                });
+            }
             StyleAttr::FlexDirection(flex_direction) => style.flex_direction = *flex_direction,
             StyleAttr::FlexWrap(flex_wrap) => style.flex_wrap = *flex_wrap,
             StyleAttr::FlexGrow(g) => style.flex_grow = computed.node.flex_grow.lerp(*g, ratio),
