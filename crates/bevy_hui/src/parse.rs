@@ -19,11 +19,12 @@ use bevy::{
     color::Color,
     ui::{UiRect, Val},
 };
+use nom::sequence::pair;
 use nom::{
     branch::alt,
     bytes::complete::{is_not, tag, take_until, take_while, take_while1, take_while_m_n},
     character::complete::{char, multispace0},
-    combinator::{complete, map, map_parser, not, rest},
+    combinator::{complete, map, map_parser, not, opt, recognize, rest},
     error::{context, ContextError, ErrorKind, ParseError},
     multi::{many0, separated_list1},
     number::complete::float,
@@ -50,12 +51,6 @@ pub fn parse_template<'a, 'b, E>(
 where
     E: ParseError<&'a [u8]> + ContextError<&'a [u8]>,
 {
-    trim_comments0(input)?;
-    let (input, _xml_header) = alt((
-        delimited(tag("<?"), take_until("?>"), tag("?>")).map(Some),
-        |i| Ok((i, None)),
-    ))(input)?;
-
     let (_, mut xml) = parse_xml_node(input)?;
 
     let mut name = None;
@@ -102,11 +97,14 @@ where
     ))
 }
 
-fn trim_comments0<'a, E>(input: &'a [u8]) -> IResult<&'a [u8], Vec<&'a [u8]>, E>
+fn comments_trimmed<'a, E>(input: &'a [u8]) -> &'a [u8]
 where
     E: ParseError<&'a [u8]> + ContextError<&'a [u8]>,
 {
-    many0(parse_comment::<E>)(input)
+    match parse_comment::<E>(input) {
+        Ok((rest, _)) => rest,
+        Err(_) => input,
+    }
 }
 
 fn parse_comment<'a, E>(input: &'a [u8]) -> IResult<&'a [u8], &'a [u8], E>
@@ -207,16 +205,14 @@ fn parse_xml_node<'a, E>(input: &'a [u8]) -> IResult<&'a [u8], Xml<'a>, E>
 where
     E: ParseError<&'a [u8]> + ContextError<&'a [u8]>,
 {
-    let (input, _) = trim_comments0(input)?;
+    let input = comments_trimmed::<E>(input);
     let (input, _) = multispace0(input)?;
-
     not(tag("</"))(input)?;
 
     let (input, (prefix, start_name)) = preceded(
         tag("<"),
         preceded(multispace0, tuple((parse_prefix0, take_snake))),
     )(input)?;
-
     let (input, attributes) = parse_xml_attr(input)?;
     let (input, is_empty) = alt((
         preceded(multispace0, tag("/>")).map(|_| true),
@@ -236,13 +232,43 @@ where
         ));
     }
 
-    let (input, children) = many0(parse_xml_node)(input)?;
+    // Parse content: interleave text and child nodes until we hit the closing tag
+    let mut input = comments_trimmed::<E>(input);
+    let mut children = vec![];
+    let mut text_parts: Vec<&[u8]> = vec![];
 
-    let (input, _) = trim_comments0(input)?;
+    loop {
+        // Try to parse text content before next child or closing tag
+        let (rest, text) = take_while(|b: u8| b != b'<')(input)?;
+        if text.len() > 0 {
+            text_parts.push(text);
+        }
+        input = rest;
 
-    let (input, value) = map(take_while(|b: u8| b != b'<'), |c: &[u8]| {
-        (c.len() > 0).then_some(c)
-    })(input)?;
+        // Trim any comments
+        input = comments_trimmed::<E>(input);
+
+        // Check if we've reached the closing tag
+        if let Ok(_) = tag::<_, _, E>("</")(input) {
+            break;
+        }
+
+        // Try to parse a child node
+        match parse_xml_node::<E>(input) {
+            Ok((rest, child)) => {
+                children.push(child);
+                input = comments_trimmed::<E>(rest);
+            }
+            Err(_) => {
+                // No more children, should be at closing tag
+                break;
+            }
+        }
+    }
+
+    // Combine all text parts into a single value
+    // For typical cases there's only one text part; for mixed content, use the first
+    let value = text_parts.into_iter().find(|t| t.len() > 0);
 
     let (input, (end_prefix, end_name)) = parse_xml_end(input)?;
     if start_name != end_name || prefix != end_prefix {
@@ -269,8 +295,8 @@ fn parse_xml_end<'a, E>(input: &'a [u8]) -> IResult<&'a [u8], (Option<&'a [u8]>,
 where
     E: ParseError<&'a [u8]> + ContextError<&'a [u8]>,
 {
-    let (input, (_, prefix, end_tag, _)) =
-        tuple((tag("</"), parse_prefix0, take_snake, tag(">")))(input)?;
+    let (input, (_, prefix, end_tag, _, _)) =
+        tuple((tag("</"), parse_prefix0, take_snake, multispace0, tag(">")))(input)?;
 
     Ok((input, (prefix, end_tag)))
 }
@@ -282,7 +308,7 @@ where
     many0(map(
         tuple((
             preceded(multispace0, parse_prefix0),
-            terminated(take_snake, tag("=")),
+            terminated(take_identifier_starting_with_letter, tag("=")),
             delimited(tag("\""), is_not("\""), tag("\"")),
         )),
         |(prefix, key, value)| XmlAttr { prefix, key, value },
@@ -312,17 +338,17 @@ fn parse_uncompiled<'a>(
     key: &'a [u8],
     value: &'a [u8],
 ) -> Option<Attribute> {
-    let result: IResult<&[u8], &[u8]> = delimited(tag("{"), is_not("}"), tag("}"))(value);
-    match result {
-        Ok((_, prop)) => {
-            return Some(Attribute::Uncompiled(AttrTokens {
-                prefix: prefix.map(|p| String::from_utf8_lossy(p).to_string()),
-                ident: String::from_utf8_lossy(key).to_string(),
-                key: String::from_utf8_lossy(prop).to_string(),
-            }));
-        }
-        Err(_) => None,
+    let value_str = std::str::from_utf8(value).ok()?;
+    let (literal_prefix, var_name, _) = crate::compile::find_template_var(value_str)?;
+    // Attribute values must start directly with `{var}` – no leading literal text.
+    if !literal_prefix.is_empty() {
+        return None;
     }
+    Some(Attribute::Uncompiled(AttrTokens {
+        prefix: prefix.map(|p| String::from_utf8_lossy(p).to_string()),
+        ident: String::from_utf8_lossy(key).to_string(),
+        key: var_name.to_string(),
+    }))
 }
 
 pub(crate) fn as_prop<'a, E>(key: &'a [u8], value: &'a [u8]) -> IResult<&'a [u8], Attribute, E>
@@ -831,7 +857,17 @@ fn take_snake<'a, E>(input: &'a [u8]) -> IResult<&'a [u8], &'a [u8], E>
 where
     E: ParseError<&'a [u8]> + ContextError<&'a [u8]>,
 {
-    take_while(|b: u8| b.is_ascii_alphabetic() || b == b'_')(input)
+    take_while1(|b: u8| b.is_ascii_alphabetic() || b == b'_')(input)
+}
+
+fn take_identifier_starting_with_letter<'a, E>(input: &'a [u8]) -> IResult<&'a [u8], &'a [u8], E>
+where
+    E: ParseError<&'a [u8]> + ContextError<&'a [u8]>,
+{
+    recognize(pair(
+        take_while1(|b: u8| b.is_ascii_alphabetic() || b == b'_'),
+        take_while(|b: u8| b.is_ascii_alphanumeric() || b == b'_'),
+    ))(input)
 }
 
 fn parse_image_scale_mode<'a, E>(input: &'a [u8]) -> IResult<&'a [u8], NodeImageMode, E>
@@ -854,7 +890,7 @@ where
     E: ParseError<&'a [u8]> + ContextError<&'a [u8]>,
 {
     context(
-        "flex_wrap has no valid value. Try `wrap` `no_wrap` `wrap_reverse`",
+        "direction has no valid value. Try `forward` `reverse` `alternate_forward` `alternate_reverse`",
         alt((
             map(tag("forward"), |_| AnimationDirection::Forward),
             map(tag("reverse"), |_| AnimationDirection::Reverse),
@@ -891,76 +927,24 @@ where
 {
     context(
         "image_atlas has no valid value. Try `(32, 32) 1 7 p(0, 0) o(0, 0)`",
-        alt((
-            complete(map(
-                tuple((
-                    preceded(multispace0, parse_dimensions),
-                    preceded(multispace0, parse_number),
-                    preceded(multispace0, parse_number),
-                    preceded(tuple((multispace0, char('p'))), parse_dimensions),
-                    preceded(tuple((multispace0, char('o'))), parse_dimensions),
-                )),
-                |(size, columns, rows, padding, offset)| {
-                    Some(Atlas {
-                        size: size,
-                        columns: columns as u32,
-                        rows: rows as u32,
-                        padding: Some(padding),
-                        offset: Some(offset),
-                    })
-                },
+        map(
+            tuple((
+                preceded(multispace0, parse_dimensions),
+                preceded(multispace0, parse_number),
+                preceded(multispace0, parse_number),
+                opt(preceded(tuple((multispace0, char('p'))), parse_dimensions)),
+                opt(preceded(tuple((multispace0, char('o'))), parse_dimensions)),
             )),
-            complete(map(
-                tuple((
-                    preceded(multispace0, parse_dimensions),
-                    preceded(multispace0, parse_number),
-                    preceded(multispace0, parse_number),
-                    preceded(tuple((multispace0, char('p'))), parse_dimensions),
-                )),
-                |(size, columns, rows, padding)| {
-                    Some(Atlas {
-                        size: size,
-                        columns: columns as u32,
-                        rows: rows as u32,
-                        padding: Some(padding),
-                        offset: None,
-                    })
-                },
-            )),
-            complete(map(
-                tuple((
-                    preceded(multispace0, parse_dimensions),
-                    preceded(multispace0, parse_number),
-                    preceded(multispace0, parse_number),
-                    preceded(tuple((multispace0, char('o'))), parse_dimensions),
-                )),
-                |(size, columns, rows, offset)| {
-                    Some(Atlas {
-                        size: size,
-                        columns: columns as u32,
-                        rows: rows as u32,
-                        padding: None,
-                        offset: Some(offset),
-                    })
-                },
-            )),
-            complete(map(
-                tuple((
-                    preceded(multispace0, parse_dimensions),
-                    preceded(multispace0, parse_number),
-                    preceded(multispace0, parse_number),
-                )),
-                |(size, columns, rows)| {
-                    Some(Atlas {
-                        size: size,
-                        columns: columns as u32,
-                        rows: rows as u32,
-                        padding: None,
-                        offset: None,
-                    })
-                },
-            )),
-        )),
+            |(size, columns, rows, padding, offset)| {
+                Some(Atlas {
+                    size,
+                    columns: columns as u32,
+                    rows: rows as u32,
+                    padding,
+                    offset,
+                })
+            },
+        ),
     )(input)
 }
 
@@ -1757,13 +1741,12 @@ fn from_hex_nib<'a, E>(input: &'a [u8]) -> IResult<&'a [u8], u8, E>
 where
     E: ParseError<&'a [u8]> + ContextError<&'a [u8]>,
 {
-    let str = std::str::from_utf8(input).expect("fix later");
+    let map_res_error =
+        || nom::Err::Error(E::from_error_kind(input, nom::error::ErrorKind::MapRes));
+    let str = std::str::from_utf8(input).map_err(|_| map_res_error())?;
     match u8::from_str_radix(format!("{}{}", str, str).as_str(), 16) {
         Ok(byte) => Ok(("".as_bytes(), byte)),
-        Err(_) => Err(nom::Err::Error(E::from_error_kind(
-            input,
-            nom::error::ErrorKind::MapRes,
-        ))),
+        Err(_) => Err(map_res_error()),
     }
 }
 
@@ -1855,14 +1838,10 @@ mod tests {
     #[test_case(r#"  <!-- hello <tag/> <""/>world -->ok"#, "ok")]
     #[test_case("   <!-- hello world -->ok", "ok")]
     fn test_comments(input: &str, expected: &str) {
-        match trim_comments0::<VerboseError<_>>(&input.as_bytes()) {
-            Ok((rem, _)) => {
-                assert_eq!(expected, std::str::from_utf8(rem).unwrap());
-            }
-            Err(_err) => {
-                assert!(false, "");
-            }
-        };
+        assert_eq!(
+            expected,
+            std::str::from_utf8(comments_trimmed::<VerboseError<_>>(&input.as_bytes())).unwrap()
+        );
     }
 
     #[test_case(r#"    pressed:background="fsdfsf"  pressed:background="fsdfsf"  <!-- test -->    pressed:background="fsdfsf" \n"#)]
@@ -1887,6 +1866,7 @@ mod tests {
     #[test_case(r#"<node pressed:background="rgb(1,1,1)" active="hello"><text p:hello="sdf">hello</text></node>"#)]
     #[test_case(r#"<slot/>"#)]
     #[test_case(r#"<node pressed:background="rgba(1,1,1,0)" active="hello" />"#)]
+    #[test_case(r#"<node><node name="press"></node></node>"#)]
     #[test_case(r#"<property name="press"><property name="press"></property></property>"#)]
     #[test_case(
         r#"
@@ -1908,6 +1888,16 @@ mod tests {
         };
     }
 
+    #[test]
+    fn test_parse_xml_node_with_newlines() {
+        let input = "
+            <text font_size=\"20\" font_color=\"#ffcc00\" margin=\"0 0 15px 0\"
+              >Building</text
+            >
+            ";
+        test_parse_xml_node(input);
+    }
+
     #[test_case("../../example/assets/demo/menu.html")]
     #[test_case("../../example/assets/demo/panel.html")]
     #[test_case("../../example/assets/demo/button.html")]
@@ -1921,14 +1911,15 @@ mod tests {
             }
         }
         let input = std::fs::read_to_string(file_path).unwrap();
-        match parse_template::<nom::error::VerboseError<_>>(
+        match parse_template::<crate::error::VerboseHtmlError>(
             input.as_bytes(),
             &mut DummyLoaderAdapter,
         ) {
             Ok((_, node)) => {
                 dbg!(node);
             }
-            Err(_err) => {
+            Err(err) => {
+                eprintln!("Error: {}", err.to_string());
                 assert!(false, "");
             }
         };
@@ -1937,6 +1928,8 @@ mod tests {
     #[test_case(r#"hover:background="{color}""#)]
     #[test_case(r#"pressed:width="10%""#)]
     #[test_case(r#"active:height="10vw""#)]
+    #[test_case(r#"tag:internationalization="text""#)]
+    #[test_case(r#"tag:i18n="text""#)]
     fn parse_attribute_parts(input: &str) {
         match parse_xml_attr::<nom::error::VerboseError<_>>(input.as_bytes()) {
             Ok((rem, attrs)) => {
@@ -1962,6 +1955,190 @@ mod tests {
             .ok()
     }
 
+    // -----------------------------------------------------------------
+    // Tests for the shared find_template_var / is_templated / compile_content
+    // (all three formerly had hand-rolled duplicate detection logic)
+    // -----------------------------------------------------------------
+
+    use crate::build::is_templated;
+    use crate::build::TemplateProperties;
+    use crate::compile::{compile_content, find_template_var};
+
+    // --- find_template_var ---
+
+    #[test]
+    fn find_template_var_simple() {
+        let (prefix, var, rest) = find_template_var("{name}").unwrap();
+        assert_eq!(prefix, "");
+        assert_eq!(var, "name");
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn find_template_var_with_prefix() {
+        let (prefix, var, rest) = find_template_var("Hello {world}!").unwrap();
+        assert_eq!(prefix, "Hello ");
+        assert_eq!(var, "world");
+        assert_eq!(rest, "!");
+    }
+
+    #[test]
+    fn find_template_var_multiple_returns_first() {
+        let (prefix, var, rest) = find_template_var("{a} and {b}").unwrap();
+        assert_eq!(prefix, "");
+        assert_eq!(var, "a");
+        assert_eq!(rest, " and {b}");
+    }
+
+    #[test]
+    fn find_template_var_trims_inner_whitespace() {
+        let (_, var, _) = find_template_var("{ padded_key }").unwrap();
+        assert_eq!(var, "padded_key");
+    }
+
+    #[test]
+    fn find_template_var_no_braces_returns_none() {
+        assert!(find_template_var("no variables here").is_none());
+    }
+
+    #[test]
+    fn find_template_var_empty_input_returns_none() {
+        assert!(find_template_var("").is_none());
+    }
+
+    // --- is_templated ---
+
+    #[test_case("{var}" => true)]
+    #[test_case("Hello {name}" => true)]
+    #[test_case("plain text" => false)]
+    #[test_case("" => false)]
+    fn test_is_templated(input: &str) -> bool {
+        is_templated(input)
+    }
+
+    // --- compile_content ---
+
+    #[test]
+    fn compile_content_single_var() {
+        let mut props = TemplateProperties::default();
+        props.set("name", "Alice");
+        assert_eq!(compile_content("{name}", &props), "Alice");
+    }
+
+    #[test]
+    fn compile_content_var_with_surrounding_text() {
+        let mut props = TemplateProperties::default();
+        props.set("greeting", "Hi");
+        assert_eq!(compile_content("{greeting}, world!", &props), "Hi, world!");
+    }
+
+    #[test]
+    fn compile_content_multiple_vars() {
+        let mut props = TemplateProperties::default();
+        props.set("first", "Bevy");
+        props.set("second", "HUI");
+        assert_eq!(compile_content("{first} + {second}", &props), "Bevy + HUI");
+    }
+
+    #[test]
+    fn compile_content_missing_var_leaves_empty() {
+        let props = TemplateProperties::default();
+        // unknown key → contributes empty string; surrounding text is preserved
+        assert_eq!(
+            compile_content("prefix {unknown} suffix", &props),
+            "prefix  suffix"
+        );
+    }
+
+    #[test]
+    fn compile_content_no_vars_returns_input_unchanged() {
+        let props = TemplateProperties::default();
+        assert_eq!(compile_content("plain text", &props), "plain text");
+    }
+
+    // --- parse_uncompiled (exercised via attribute_from_parts) ---
+
+    #[test]
+    fn parse_uncompiled_detects_template_variable() {
+        use crate::data::Attribute;
+        struct DummyLoader;
+        impl crate::adaptor::AssetLoadAdaptor for DummyLoader {
+            fn load<'a, A: bevy::prelude::Asset>(
+                &mut self,
+                _path: impl Into<bevy::asset::AssetPath<'a>>,
+            ) -> bevy::prelude::Handle<A> {
+                bevy::prelude::Handle::default()
+            }
+        }
+        let result = attribute_from_parts::<nom::error::Error<&[u8]>>(
+            None,
+            b"width",
+            b"{my_width}",
+            &mut DummyLoader,
+        );
+        match result.unwrap().1 {
+            Attribute::Uncompiled(tokens) => {
+                assert_eq!(tokens.ident, "width");
+                assert_eq!(tokens.key, "my_width");
+                assert!(tokens.prefix.is_none());
+            }
+            other => panic!("expected Uncompiled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_uncompiled_with_hover_prefix() {
+        use crate::data::Attribute;
+        struct DummyLoader;
+        impl crate::adaptor::AssetLoadAdaptor for DummyLoader {
+            fn load<'a, A: bevy::prelude::Asset>(
+                &mut self,
+                _path: impl Into<bevy::asset::AssetPath<'a>>,
+            ) -> bevy::prelude::Handle<A> {
+                bevy::prelude::Handle::default()
+            }
+        }
+        let result = attribute_from_parts::<nom::error::Error<&[u8]>>(
+            Some(b"hover"),
+            b"background",
+            b"{my_color}",
+            &mut DummyLoader,
+        );
+        match result.unwrap().1 {
+            Attribute::Uncompiled(tokens) => {
+                assert_eq!(tokens.prefix.as_deref(), Some("hover"));
+                assert_eq!(tokens.ident, "background");
+                assert_eq!(tokens.key, "my_color");
+            }
+            other => panic!("expected Uncompiled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_uncompiled_literal_value_is_not_a_template() {
+        use crate::data::Attribute;
+        struct DummyLoader;
+        impl crate::adaptor::AssetLoadAdaptor for DummyLoader {
+            fn load<'a, A: bevy::prelude::Asset>(
+                &mut self,
+                _path: impl Into<bevy::asset::AssetPath<'a>>,
+            ) -> bevy::prelude::Handle<A> {
+                bevy::prelude::Handle::default()
+            }
+        }
+        let result = attribute_from_parts::<nom::error::Error<&[u8]>>(
+            None,
+            b"width",
+            b"100px",
+            &mut DummyLoader,
+        );
+        // A plain literal must not be misidentified as a template variable.
+        match result.unwrap().1 {
+            Attribute::Style(_) => {}
+            other => panic!("expected Style, got {:?}", other),
+        }
+    }
+
     #[test_case(r#"10px stretch stretch 1"#)]
     fn test_parse_nine_slice(input: &str) {
         let (_, slice) = parse_image_slice::<nom::error::Error<_>>(input.as_bytes()).unwrap();
@@ -1972,5 +2149,53 @@ mod tests {
         //     sides_scale_mode: todo!(),
         //     max_corner_scale: todo!(),
         // };
+    }
+
+    // Atlas: size columns rows [p(padding)] [o(offset)]
+    #[test_case(
+        "(32, 32) 4 8 p(1, 2) o(3, 4)",
+        Some(Atlas { size: UVec2::new(32, 32), columns: 4, rows: 8,
+                     padding: Some(UVec2::new(1, 2)), offset: Some(UVec2::new(3, 4)) });
+        "size columns rows padding offset"
+    )]
+    #[test_case(
+        "(32, 32) 4 8 p(1, 2)",
+        Some(Atlas { size: UVec2::new(32, 32), columns: 4, rows: 8,
+                     padding: Some(UVec2::new(1, 2)), offset: None });
+        "size columns rows padding only"
+    )]
+    #[test_case(
+        "(32, 32) 4 8 o(3, 4)",
+        Some(Atlas { size: UVec2::new(32, 32), columns: 4, rows: 8,
+                     padding: None, offset: Some(UVec2::new(3, 4)) });
+        "size columns rows offset only"
+    )]
+    #[test_case(
+        "(32, 32) 4 8",
+        Some(Atlas { size: UVec2::new(32, 32), columns: 4, rows: 8,
+                     padding: None, offset: None });
+        "size columns rows only"
+    )]
+    #[test_case(
+        "16 10 5",
+        Some(Atlas { size: UVec2::new(16, 16), columns: 10, rows: 5,
+                     padding: None, offset: None });
+        "scalar size no optional fields"
+    )]
+    fn test_parse_atlas(input: &str, expected: Option<Atlas>) {
+        match parse_atlas::<VerboseHtmlError>(input.as_bytes()) {
+            Ok((rem, atlas)) => {
+                assert_eq!(expected, atlas);
+                assert_eq!(
+                    rem.len(),
+                    0,
+                    "unexpected trailing input: {:?}",
+                    std::str::from_utf8(rem)
+                );
+            }
+            Err(err) => {
+                panic!("parse_atlas failed for {:?}: {}", input, err);
+            }
+        }
     }
 }
